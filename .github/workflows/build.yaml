@@ -1,0 +1,69 @@
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+name: Continous Deployment
+env:
+  IMAGE_NAME: "${{secrets.CR_URL}}/${{github.repository}}"
+  K8S_NAMESPACE: github-actions-test
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get branch name (merge)
+        if: github.event_name != 'pull_request'
+        run: echo "BRANCH_NAME=$(echo ${GITHUB_REF#refs/heads/} | tr / -)" >> $GITHUB_ENV
+
+      - name: Get branch name (pull request)
+        if: github.event_name == 'pull_request'
+        run: echo "BRANCH_NAME=$(echo ${GITHUB_HEAD_REF} | tr / -)" >> $GITHUB_ENV
+
+      - uses: actions/checkout@v2
+
+      - name: Docker Build
+        run: |
+          docker build . -t ${IMAGE_NAME}:${GITHUB_SHA}
+          docker tag ${IMAGE_NAME}:${GITHUB_SHA} ${IMAGE_NAME}:${BRANCH_NAME}
+
+      - name: Docker Push
+        run: |
+          echo -n "${{secrets.CR_PASSWORD}}" \
+            | docker login -u "${{secrets.CR_USERNAME}}" --password-stdin ${{secrets.CR_URL}}
+          docker push ${IMAGE_NAME}:${BRANCH_NAME}
+          docker push ${IMAGE_NAME}:${GITHUB_SHA}
+
+  release:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    steps:
+      - uses: actions/checkout@v2
+      - name: Create release
+        run: |
+          docker run --rm --name palisade -v $(pwd):/workspace -e GITHUB_TOKEN -e GITHUB_REF -e GITHUB_REPOSITORY --workdir /workspace lightspeedhq/palisade palisade github-action
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+
+  deploy:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    needs: release
+    steps:
+      - uses: actions/checkout@v2
+      - uses: azure/k8s-set-context@v1
+        with:
+          method: service-account
+          k8s-url: ${{secrets.K8S_API_URL}}
+          k8s-secret: ${{secrets.K8S_SECRET}}
+      - name: Deploy to env ${{env.BRANCH_NAME}}
+        shell: bash
+        run: |
+          sed 's,%NAMESPACE%,${{env.K8S_NAMESPACE}},g' manifests/app.yaml \
+          | sed 's,%IMAGE_NAME%,${{env.IMAGE_NAME}}:${{github.sha}},g' \
+          | tee \
+          | kubectl apply -f -
